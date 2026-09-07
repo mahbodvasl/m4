@@ -1,1 +1,197 @@
+name: Windows GPU Cloud RDP
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # این label باید دقیقاً با label رانر GPU که در Organization ساخته‌ای
+    # مطابقت داشته باشد.
+    runs-on:
+      labels: windows-4-core-gpu
+
+    timeout-minutes: 360
+
+    steps:
+
+      - name: 1. Check GPU
+        shell: powershell
+        run: |
+          Write-Host "Checking NVIDIA GPU..."
+          nvidia-smi
+
+          Write-Host ""
+          Write-Host "GPU information:"
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, AdapterRAM, DriverVersion
+
+      - name: 2. Enable Remote Desktop
+        shell: powershell
+        run: |
+          Write-Host "Enabling Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Write-Host "RDP enabled."
+
+      - name: 3. Create RDP Admin Account
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is not configured."
+          }
+
+          $Password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $ExistingUser = Get-LocalUser `
+            -Name "CloudAdmin" `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $ExistingUser) {
+
+            New-LocalUser `
+              -Name "CloudAdmin" `
+              -Password $Password `
+              -PasswordNeverExpires `
+              -AccountNeverExpires `
+              -Description "Temporary Cloud GPU RDP account"
+
+          } else {
+
+            Set-LocalUser `
+              -Name "CloudAdmin" `
+              -Password $Password
+
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "CloudAdmin" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "CloudAdmin account ready."
+
+      - name: 4. Install Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "TAILSCALE_AUTHKEY secret is not configured."
+          }
+
+          Write-Host "Downloading Tailscale..."
+
+          Invoke-WebRequest `
+            "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "$env:TEMP\tailscale.msi"
+
+          Write-Host "Installing Tailscale..."
+
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" `
+            -Wait
+
+          Start-Sleep -Seconds 10
+
+          Write-Host "Connecting to Tailscale..."
+
+          & "C:\Program Files\Tailscale\tailscale.exe" up `
+            --authkey="$env:TAILSCALE_AUTHKEY" `
+            --hostname="github-gpu-rdp"
+
+          Start-Sleep -Seconds 10
+
+      - name: 5. Get Tailscale IP
+        shell: powershell
+        run: |
+
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          $ts_ip = & $Tailscale ip -4
+
+          if ([string]::IsNullOrWhiteSpace($ts_ip)) {
+            throw "Could not obtain Tailscale IPv4 address."
+          }
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "       WINDOWS GPU RDP IS READY"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "Tailscale IP : $ts_ip"
+          Write-Host "Username     : CloudAdmin"
+          Write-Host ""
+          Write-Host "Connect with:"
+          Write-Host "mstsc.exe /v:$ts_ip"
+          Write-Host ""
+          Write-Host "=============================================="
+
+      - name: 6. Verify GPU
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "========== NVIDIA GPU =========="
+
+          nvidia-smi
+
+          Write-Host ""
+          Write-Host "========== CUDA =========="
+
+          try {
+            nvcc --version
+          }
+          catch {
+            Write-Host "CUDA compiler (nvcc) not installed."
+          }
+
+      - name: 7. Keep Server Alive
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " RDP SERVER WILL STAY ONLINE UNTIL JOB ENDS"
+          Write-Host "=============================================="
+
+          while ($true) {
+
+            $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+            Write-Host "[$time] Server running..."
+
+            Start-Sleep -Seconds 60
+          }
+
+      - name: 8. Cleanup
+        if: always()
+        shell: powershell
+        run: |
+
+          Write-Host "Cleaning up Tailscale..."
+
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (Test-Path $Tailscale) {
+            & $Tailscale logout
+          }
+
+          Write-Host "Cleanup completed."
